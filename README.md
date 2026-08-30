@@ -1,15 +1,15 @@
 # Google JWT + Akka Streams + Kafka – Token Cache Demo
 
-A **completely runnable**, containerized Scala project that demonstrates:
+A Plus and Play, containerized Scala project that demonstrates:
 
-- Caching Google OAuth2 / JWT access (or ID) tokens with **Caffeine**
-- Using the cached token with **Apache Kafka** via **Akka Streams / Alpakka Kafka**
-- Full **observability** (Prometheus metrics + Grafana dashboard)
+- Caching Google OAuth2 / JWT access (or ID) tokens with Caffeine
+- Using the cached token with Apache Kafka via Akka Streams 
+- Technical Observation (Prometheus metrics + Grafana dashboard)
 - Health / readiness endpoints
 - Unit tests
 - One-command `docker compose up`
 
-Perfect for cloning to GitHub and running anywhere.
+Perfect for cloning to GitHub and running anywhere. This was built for testing and experimenting with some of the projects I have worked on. It is fun but interesting. 
 
 ---
 
