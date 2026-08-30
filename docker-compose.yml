@@ -1,0 +1,90 @@
+version: "3.8"
+
+services:
+  # ---------- Kafka (KRaft mode – no ZooKeeper) ----------
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: jwt-demo-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      - KAFKA_CFG_NODE_ID=0
+      - KAFKA_CFG_PROCESS_ROLES=controller,broker
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka:9093
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - jwt-demo
+
+  # ---------- The application ----------
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: jwt-demo-app
+    ports:
+      - "8080:8080"   # health + metrics
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=jwt-demo-topic
+      - METRICS_PORT=8080
+      - PRODUCER_INTERVAL=5s
+      # Uncomment & mount a real service-account key for production Google auth:
+      # - GOOGLE_APPLICATION_CREDENTIALS=/secrets/sa.json
+    volumes:
+      # - ./secrets/sa.json:/secrets/sa.json:ro
+      - ./logs:/app/logs
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - jwt-demo
+    restart: unless-stopped
+
+  # ---------- Prometheus ----------
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: jwt-demo-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=2d"
+    depends_on:
+      - app
+    networks:
+      - jwt-demo
+
+  # ---------- Grafana ----------
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: jwt-demo-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    networks:
+      - jwt-demo
+
+networks:
+  jwt-demo:
+    driver: bridge
