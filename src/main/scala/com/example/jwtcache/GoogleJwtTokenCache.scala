@@ -13,8 +13,10 @@ import scala.util.Try
  * Thread-safe, observable cache for Google access / ID tokens.
  *
  * - Uses Caffeine for automatic expiry & refresh
- * - Exposes Prometheus metrics
+ * - Respects real token expiry (with skew) in addition to Caffeine TTL
+ * - Exposes Prometheus metrics with correct hit/miss/error labeling
  * - Supports both Access Tokens and ID Tokens (JWT)
+ * - Falls back to mock credentials when ADC is unavailable (local/dev)
  */
 class GoogleJwtTokenCache(
     scopes: Seq[String] = Seq("https://www.googleapis.com/auth/cloud-platform"),
@@ -29,7 +31,7 @@ class GoogleJwtTokenCache(
   private val tokenRequests = Counter
     .build()
     .name("google_jwt_token_requests_total")
-    .help("Total token requests (cache hit + miss)")
+    .help("Total token requests (cache hit + miss + error)")
     .labelNames("result")
     .register()
 
@@ -61,7 +63,9 @@ class GoogleJwtTokenCache(
     base.createScoped(scopes: _*)
   }
 
-  // ---------- Caffeine cache ----------
+  private val usingMock: Boolean = credentials.isInstanceOf[MockGoogleCredentials]
+
+  // ---------- Caffeine cache (TTL is a safety net; real expiry is checked via expiresAtMs) ----------
   private val cache: LoadingCache[String, CachedToken] = Caffeine
     .newBuilder()
     .expireAfterWrite(cacheTtlMinutes, TimeUnit.MINUTES)
@@ -69,17 +73,29 @@ class GoogleJwtTokenCache(
     .recordStats()
     .build((_: String) => fetchFreshToken())
 
-  private case class CachedToken(value: String, expiresAtMs: Long)
+  private case class CachedToken(value: String, expiresAtMs: Long) {
+    def isExpired(nowMs: Long = System.currentTimeMillis()): Boolean = nowMs >= expiresAtMs
+  }
 
   private def fetchFreshToken(): CachedToken = {
     val timer = tokenRefreshDuration.startTimer()
     try {
-      log.info("Refreshing Google token (audience={})", audience.getOrElse("access-token"))
+      log.info(
+        "Refreshing Google token (audience={}, mock={})",
+        audience.getOrElse("access-token"),
+        usingMock
+      )
 
       credentials.refreshIfExpired()
 
-      val (tokenValue, expiresInMs) = audience match {
-        case Some(aud) =>
+      val (tokenValue, expiresInMs) = (audience, usingMock) match {
+        // Mock path for ID tokens – avoids ClassCastException on IdTokenProvider
+        case (Some(_), true) =>
+          val fakeJwt = MockGoogleCredentials.fakeJwt
+          (fakeJwt, 3600_000L)
+
+        // Real ID token path
+        case (Some(aud), false) =>
           val idTokenCreds = IdTokenCredentials
             .newBuilder()
             .setIdTokenProvider(credentials.asInstanceOf[IdTokenProvider])
@@ -93,7 +109,8 @@ class GoogleJwtTokenCache(
               .getOrElse(3600_000L)
           )
 
-        case None =>
+        // Access token (real or mock)
+        case (None, _) =>
           val token = credentials.getAccessToken
           (
             token.getTokenValue,
@@ -108,6 +125,7 @@ class GoogleJwtTokenCache(
       tokenRequests.labels("miss").inc()
 
       log.info("Token refreshed successfully, expires in ~{}s", expiresInMs / 1000)
+      // Store absolute expiry with skew so we refresh slightly before Google expires the token
       CachedToken(tokenValue, System.currentTimeMillis() + expiresInMs - (refreshSkewSeconds * 1000))
     } catch {
       case ex: Exception =>
@@ -119,22 +137,43 @@ class GoogleJwtTokenCache(
     }
   }
 
-  /** Non-blocking get – returns cached token or triggers refresh */
+  /**
+   * Non-blocking get – returns a valid cached token or triggers a refresh.
+   * Correctly labels Prometheus metrics as hit vs miss.
+   * Invalidates and reloads if the stored token has passed its (skewed) expiry.
+   */
   def getToken: Future[String] = Future {
-    val token = cache.get("google-token")
-    tokenRequests.labels("hit").inc()
-    cacheSize.set(cache.estimatedSize())
-    token.value
+    val key = "google-token"
+
+    Option(cache.getIfPresent(key)) match {
+      case Some(cached) if !cached.isExpired() =>
+        tokenRequests.labels("hit").inc()
+        cacheSize.set(cache.estimatedSize())
+        cached.value
+
+      case Some(_) =>
+        // Present but past skewed expiry – force reload
+        log.debug("Cached token past skewed expiry – forcing refresh")
+        cache.invalidate(key)
+        val fresh = cache.get(key) // loader increments "miss"
+        cacheSize.set(cache.estimatedSize())
+        fresh.value
+
+      case None =>
+        val fresh = cache.get(key) // loader increments "miss"
+        cacheSize.set(cache.estimatedSize())
+        fresh.value
+    }
   }
 
-  /** Force invalidation (e.g. after receiving 401 from Kafka) */
+  /** Force invalidation (e.g. after receiving 401 from a downstream service) */
   def invalidate(): Unit = {
     log.info("Invalidating token cache")
     cache.invalidateAll()
     cacheSize.set(0)
   }
 
-  /** Current cache stats for health endpoint */
+  /** Current cache stats for the /token-stats endpoint */
   def stats: Map[String, Any] = {
     val s = cache.stats()
     Map(
@@ -143,24 +182,28 @@ class GoogleJwtTokenCache(
       "loadSuccess"   -> s.loadSuccessCount(),
       "loadFailure"   -> s.loadFailureCount(),
       "evictionCount" -> s.evictionCount(),
-      "estimatedSize" -> cache.estimatedSize()
+      "estimatedSize" -> cache.estimatedSize(),
+      "usingMock"     -> usingMock
     )
   }
 }
 
 /**
  * Minimal mock credentials used when running locally without GCP ADC.
- * Returns a deterministic fake JWT so the rest of the pipeline can be exercised.
+ * Returns a deterministic fake JWT so the pipeline can be exercised without a GCP project.
+ * Access-token and ID-token demo paths both work with this mock.
  */
 class MockGoogleCredentials extends GoogleCredentials {
-  override def refreshAccessToken(): com.google.auth.oauth2.AccessToken = {
-    val fakeJwt =
-      "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9." +
-        "eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6Ik1vY2sgVXNlciIsImlhdCI6MTUxNjIzOTAyMiwiZXhwIjo5OTk5OTk5OTk5fQ." +
-        "mock-signature"
+  override def refreshAccessToken(): com.google.auth.oauth2.AccessToken =
     new com.google.auth.oauth2.AccessToken(
-      fakeJwt,
+      MockGoogleCredentials.fakeJwt,
       new java.util.Date(System.currentTimeMillis() + 3600_000)
     )
-  }
+}
+
+object MockGoogleCredentials {
+  val fakeJwt: String =
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9." +
+      "eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6Ik1vY2sgVXNlciIsImlhdCI6MTUxNjIzOTAyMiwiZXhwIjo5OTk5OTk5OTk5fQ." +
+      "mock-signature"
 }

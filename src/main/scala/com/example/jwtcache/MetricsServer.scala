@@ -15,11 +15,11 @@ import scala.util.{Failure, Success}
 
 /**
  * Lightweight HTTP server exposing:
- *   GET /healthz          – liveness
- *   GET /readyz           – readiness (token cache reachable)
- *   GET /metrics          – Prometheus scrape endpoint
- *   GET /token-stats      – human-readable cache stats
- *   POST /force-refresh   – invalidate cache and force a new token
+ *   GET  /healthz          – liveness
+ *   GET  /readyz           – readiness (token cache reachable)
+ *   GET  /metrics          – Prometheus scrape endpoint
+ *   GET  /token-stats      – human-readable cache stats
+ *   POST /force-refresh    – invalidate cache and force a new token on next request
  */
 class MetricsServer(
     tokenCache: GoogleJwtTokenCache,
@@ -29,7 +29,8 @@ class MetricsServer(
 
   private val log = LoggerFactory.getLogger(getClass)
 
-  private val route: Route =
+  /** Public so unit tests can exercise the real routes. */
+  val routes: Route =
     path("healthz") {
       get {
         complete(StatusCodes.OK -> "OK")
@@ -58,7 +59,11 @@ class MetricsServer(
           complete {
             val stats = tokenCache.stats
             val json = stats
-              .map { case (k, v) => s""""$k": $v""" }
+              .map {
+                case (k, v: String)  => s""""$k": "$v""""
+                case (k, v: Boolean) => s""""$k": $v"""
+                case (k, v)          => s""""$k": $v"""
+              }
               .mkString("{", ", ", "}")
             HttpEntity(ContentTypes.`application/json`, json)
           }
@@ -72,7 +77,7 @@ class MetricsServer(
       }
 
   def start(): Future[Http.ServerBinding] = {
-    val binding = Http().newServerAt(interface, port).bind(route)
+    val binding = Http().newServerAt(interface, port).bind(routes)
     binding.onComplete {
       case Success(b) =>
         log.info(

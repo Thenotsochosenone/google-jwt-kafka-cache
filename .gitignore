@@ -1,0 +1,38 @@
+# sbt
+target/
+project/target/
+project/project/
+.bsp/
+.metals/
+.bloop/
+.scala-build/
+.sbtopts
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+
+# Logs & secrets
+logs/
+*.log
+secrets/
+*.pem
+*.p12
+# Keep Grafana dashboard JSON; ignore other JSON (e.g. SA keys)
+*.json
+!grafana/dashboards/*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.jar
+*.class
+
+# Local env
+.env
+.env.*

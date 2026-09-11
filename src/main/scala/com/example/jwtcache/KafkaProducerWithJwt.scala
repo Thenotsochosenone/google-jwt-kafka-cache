@@ -50,9 +50,7 @@ class KafkaProducerWithJwt(
       .tick(0.seconds, interval, ())
       .mapAsync(1) { _ =>
         tokenCache.getToken.map { token =>
-          val preview =
-            if (token.length > 40) token.take(20) + "..." + token.takeRight(10)
-            else token
+          val preview = if (token.length > 40) token.take(20) + "..." + token.takeRight(10) else token
           val payload =
             s"""{"ts":${System.currentTimeMillis()},"tokenPreview":"$preview","source":"google-jwt-cache-demo"}"""
           new ProducerRecord[String, String](topic, s"key-${System.currentTimeMillis()}", payload)

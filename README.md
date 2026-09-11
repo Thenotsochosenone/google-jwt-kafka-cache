@@ -1,15 +1,15 @@
 # Google JWT + Akka Streams + Kafka – Token Cache Demo
 
-A Plus and Play, containerized Scala project that demonstrates:
+A **runnable, containerized** Scala demo that shows how to:
 
-- Caching Google OAuth2 / JWT access (or ID) tokens with Caffeine
-- Using the cached token with Apache Kafka via Akka Streams 
-- Technical Observation (Prometheus metrics + Grafana dashboard)
-- Health / readiness endpoints
-- Unit tests
-- One-command `docker compose up`
+- Cache Google OAuth2 access tokens (and ID tokens) with **Caffeine**
+- Drive **Apache Kafka** produce/consume with **Akka Streams / Alpakka Kafka**
+- Expose **Prometheus metrics**, health/readiness, and a **Grafana** dashboard
+- Run end-to-end **without a GCP project** via mock credentials
 
-Perfect for cloning to GitHub and running anywhere. This was built for testing and experimenting with some of the projects I have worked on. It is fun but interesting. 
+> **This is a demo, not production auth wiring.**  
+> Kafka uses plain (no SASL) so you can observe the pipeline locally.  
+> Real Google Managed Kafka `OAUTHBEARER` setup is documented as comments and in the Production notes section — you must wire the official `GcpLoginCallbackHandler` (or equivalent) for production.
 
 ---
 
@@ -46,39 +46,39 @@ Perfect for cloning to GitHub and running anywhere. This was built for testing a
 ## Quick Start (Docker – recommended)
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/Thenotsochosenone/google-jwt-kafka-cache.git
 cd google-jwt-kafka-cache
 
-# Start everything (Kafka + app + Prometheus + Grafana)
+# Start Kafka + app + Prometheus + Grafana
 docker compose up --build -d
 
-# Wait ~30-40 s for Kafka to become healthy
+# Wait ~30–40 s for Kafka to become healthy, then follow logs
 docker compose logs -f app
 ```
 
 ### Access points
 
-| Service          | URL                              | Credentials      |
-|------------------|----------------------------------|------------------|
-| App health       | http://localhost:8080/healthz    | —                |
-| App readiness    | http://localhost:8080/readyz     | —                |
-| Prometheus metrics | http://localhost:8080/metrics  | —                |
-| Token cache stats| http://localhost:8080/token-stats| —                |
-| Force token refresh | `POST http://localhost:8080/force-refresh` | —          |
-| Prometheus UI    | http://localhost:9090            | —                |
-| Grafana          | http://localhost:3000            | admin / admin    |
+| Service              | URL                                          | Credentials   |
+|----------------------|----------------------------------------------|---------------|
+| App health           | http://localhost:8080/healthz                | —             |
+| App readiness        | http://localhost:8080/readyz                 | —             |
+| Prometheus metrics   | http://localhost:8080/metrics                | —             |
+| Token cache stats    | http://localhost:8080/token-stats            | —             |
+| Force token refresh  | `POST http://localhost:8080/force-refresh`   | —             |
+| Prometheus UI        | http://localhost:9090                        | —             |
+| Grafana              | http://localhost:3000                        | admin / admin |
 
 In Grafana open the pre-provisioned dashboard **“Google JWT Kafka Cache”**.
 
 ---
 
-## Local development (without Docker)
+## Local development (without full Docker stack)
 
 ### Prerequisites
 
 - JDK 21+
-- sbt 1.9+
-- A running Kafka (or use the `kafka` service from docker-compose)
+- sbt 1.10.x (pinned in `project/build.properties`)
+- A running Kafka (or: `docker compose up kafka -d`)
 
 ```bash
 # Start only Kafka
@@ -91,7 +91,7 @@ sbt test
 sbt run
 ```
 
-The app will use **mock Google credentials** when Application Default Credentials are not present, so you can exercise the whole pipeline locally without a GCP project.
+When Application Default Credentials are missing, the app uses **mock Google credentials** so the full pipeline runs without a GCP project. The mock supports both access-token and ID-token (audience) paths.
 
 ---
 
@@ -108,13 +108,23 @@ environment:
   - GOOGLE_APPLICATION_CREDENTIALS=/secrets/sa.json
 ```
 
-3. (Optional) Request an **ID token** instead of an access token by setting:
+3. (Optional) Request an **ID token** instead of an access token:
 
 ```hocon
 app.google.audience = "https://your-service.example.com"
 ```
 
-or the env var equivalent.
+---
+
+## What this demo does vs production Kafka auth
+
+| Concern | This demo | Production (Google Managed Kafka) |
+|---------|-----------|-----------------------------------|
+| Kafka security | Plaintext (easy local observability) | `SASL_SSL` + `OAUTHBEARER` |
+| Token usage | Cached token; preview embedded in message payload | Token used only for SASL login via callback handler |
+| Recommended handler | — | `com.google.cloud.hosted.kafka.auth.GcpLoginCallbackHandler` |
+
+See comments in `KafkaProducerWithJwt.scala` for the exact producer properties to enable real OAUTHBEARER.
 
 ---
 
@@ -123,6 +133,9 @@ or the env var equivalent.
 ```
 google-jwt-kafka-cache/
 ├── build.sbt
+├── project/
+│   ├── build.properties          # pins sbt 1.10.2
+│   └── plugins.sbt
 ├── docker-compose.yml
 ├── docker/Dockerfile
 ├── prometheus/prometheus.yml
@@ -130,7 +143,7 @@ google-jwt-kafka-cache/
 │   ├── provisioning/...
 │   └── dashboards/jwt-cache-dashboard.json
 ├── src/main/scala/com/example/jwtcache/
-│   ├── GoogleJwtTokenCache.scala   # core cache + metrics
+│   ├── GoogleJwtTokenCache.scala   # core cache + metrics + mock
 │   ├── KafkaProducerWithJwt.scala
 │   ├── KafkaConsumerWithJwt.scala
 │   ├── MetricsServer.scala
@@ -143,14 +156,14 @@ google-jwt-kafka-cache/
 
 ## Key design decisions
 
-| Decision                        | Why |
-|---------------------------------|-----|
-| Caffeine cache                  | Extremely fast, supports TTL + stats out of the box |
-| Mock credentials fallback       | Makes the demo runnable without GCP |
-| Prometheus + Grafana            | Industry standard, dashboard is pre-loaded |
-| Fat-jar via sbt-assembly        | Simple, single-file deployment |
-| Multi-stage Docker build        | Small runtime image (~200 MB) |
-| KRaft Kafka (no ZooKeeper)      | Modern, fewer moving parts |
+| Decision | Why |
+|----------|-----|
+| Caffeine cache | Fast, TTL + stats; we also respect real token expiry with skew |
+| Correct hit/miss metrics | `getIfPresent` + loader only counts true misses/errors |
+| Mock credentials fallback | Demo runs without GCP; supports access + ID token paths |
+| Prometheus + Grafana | Pre-loaded dashboard for token refresh / cache / JVM |
+| Fat-jar via sbt-assembly | Simple single-file image in multi-stage Dockerfile |
+| KRaft Kafka (no ZooKeeper) | Fewer moving parts for the demo stack |
 
 ---
 
@@ -163,20 +176,23 @@ sbt test
 Covers:
 
 - Token cache hit / miss / invalidate
-- Cache statistics
-- Metrics HTTP endpoints
+- Mock ID-token (audience) path without ClassCastException
+- Cache statistics (`usingMock`, sizes, etc.)
+- Real `MetricsServer` routes: `/healthz`, `/readyz`, `/metrics`, `/token-stats`, `POST /force-refresh`
 
 ---
 
 ## Production notes
 
-- Prefer the official Google `GcpLoginCallbackHandler` when talking to **Google Cloud Managed Service for Apache Kafka**.
-- The custom cache shown here is useful when you need the token for other Google APIs as well, or when you want full control over refresh timing and metrics.
+- Prefer the official Google `GcpLoginCallbackHandler` for **Google Cloud Managed Service for Apache Kafka**.
+- The custom cache is useful when you need the same token for other Google APIs or full control over refresh timing and metrics.
 - Always refresh a short time **before** the token expires (`refreshSkewSeconds`).
 - Expose `/metrics` only on an internal network or protect it.
+- Pin dependencies and sbt (`project/build.properties`) for reproducible builds.
+- Do not commit secrets; `.gitignore` excludes `secrets/` and `*.json` (except the Grafana dashboard).
 
 ---
 
 ## License
 
-Apache 2.0 – free to use, modify and publish on GitHub.
+Apache 2.0 – free to use, modify, and publish on GitHub.

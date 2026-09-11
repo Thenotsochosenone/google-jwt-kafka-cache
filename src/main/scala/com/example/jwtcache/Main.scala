@@ -27,9 +27,7 @@ object Main extends App {
   val topic            = config.getString("app.kafka.topic")
   val metricsPort      = config.getInt("app.metrics.port")
   val produceInterval  = config.getDuration("app.producer.interval").toMillis.millis
-  val audience =
-    if (config.hasPath("app.google.audience")) Some(config.getString("app.google.audience"))
-    else None
+  val audience         = if (config.hasPath("app.google.audience")) Some(config.getString("app.google.audience")) else None
 
   log.info(
     """

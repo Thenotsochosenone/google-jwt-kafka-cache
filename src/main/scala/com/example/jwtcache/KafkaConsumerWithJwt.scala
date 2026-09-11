@@ -1,7 +1,7 @@
 package com.example.jwtcache
 
 import akka.actor.typed.ActorSystem
-import akka.kafka.scaladsl.{Committer, Consumer}
+import akka.kafka.scaladsl.{Consumer, Committer}
 import akka.kafka.{CommitterSettings, ConsumerSettings, Subscriptions}
 import akka.stream.scaladsl.Sink
 import org.apache.kafka.clients.consumer.ConsumerConfig

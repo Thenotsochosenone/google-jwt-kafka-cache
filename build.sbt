@@ -1,4 +1,4 @@
-ThisBuild / version      := "1.0.0"
+ThisBuild / version      := "1.0.1"
 ThisBuild / scalaVersion := "2.13.14"
 ThisBuild / organization := "com.example"
 
@@ -42,30 +42,25 @@ lazy val root = (project in file("."))
       // Tests
       "org.scalatest"     %% "scalatest"                  % "3.2.19"  % Test,
       "com.typesafe.akka" %% "akka-stream-testkit"        % "2.9.3"   % Test,
+      "com.typesafe.akka" %% "akka-actor-testkit-typed"   % "2.9.3"   % Test,
       "com.typesafe.akka" %% "akka-http-testkit"          % "10.6.3"  % Test,
       "org.scalatestplus" %% "mockito-5-12"               % "10.0.0"  % Test
     ),
 
-    // Assembly for fat jar
+    // Fat jar for the multi-stage Dockerfile
     assembly / assemblyMergeStrategy := {
       case PathList("META-INF", xs @ _*) =>
-        xs map { _.toLowerCase } match {
+        xs.map(_.toLowerCase) match {
           case "manifest.mf" :: Nil | "index.list" :: Nil | "dependencies" :: Nil =>
             MergeStrategy.discard
-          case _ => MergeStrategy.first
+          case "services" :: _ => MergeStrategy.filterDistinctLines
+          case _               => MergeStrategy.first
         }
-      case "reference.conf" => MergeStrategy.concat
+      case "reference.conf" | "application.conf" => MergeStrategy.concat
+      case "module-info.class"                   => MergeStrategy.discard
       case x =>
         val oldStrategy = (assembly / assemblyMergeStrategy).value
         oldStrategy(x)
     },
     assembly / mainClass := Some("com.example.jwtcache.Main")
   )
-
-enablePlugins(JavaAppPackaging)
-enablePlugins(DockerPlugin)
-
-dockerBaseImage    := "eclipse-temurin:21-jre-jammy"
-dockerExposedPorts := Seq(8080, 9095)
-dockerUpdateLatest := true
-dockerAlias        := DockerAlias(None, Some("google-jwt-kafka-cache"), "google-jwt-kafka-cache", Some("latest"))
