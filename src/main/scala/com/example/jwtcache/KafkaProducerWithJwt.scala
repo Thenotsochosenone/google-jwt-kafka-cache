@@ -3,11 +3,13 @@ package com.example.jwtcache
 import akka.actor.typed.ActorSystem
 import akka.kafka.ProducerSettings
 import akka.kafka.scaladsl.Producer
-import akka.stream.scaladsl.{Sink, Source}
+import akka.stream.scaladsl.Source
 import org.apache.kafka.clients.producer.ProducerRecord
 import org.apache.kafka.common.serialization.StringSerializer
 import org.slf4j.LoggerFactory
 
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -17,8 +19,10 @@ import scala.concurrent.{ExecutionContext, Future}
  *
  * In real deployments you would configure the official GcpLoginCallbackHandler
  * or a custom AuthenticateCallbackHandler that reads from GoogleJwtTokenCache.
- * Here we keep the example self-contained and also emit the token into the
- * message payload so you can observe it in the consumer / dashboard.
+ * Here we keep the example self-contained; each message carries a SHA-256
+ * fingerprint of the current token (not the token, and not a slice of it)
+ * so you can observe rotation in the consumer / dashboard without ever
+ * putting recoverable credential material on the wire.
  */
 class KafkaProducerWithJwt(
     tokenCache: GoogleJwtTokenCache,
@@ -40,8 +44,10 @@ class KafkaProducerWithJwt(
       .withProperty("retries", "3")
 
   /**
-   * Continuously produces messages that contain the current Google token
-   * (truncated for demo). In production the token is used only for auth.
+   * Continuously produces messages carrying a non-recoverable fingerprint
+   * of the current Google token (never the token itself, or any slice of
+   * it — see tokenFingerprint below). In production the token is used
+   * only for SASL/OAUTHBEARER auth and never appears in message payloads.
    */
   def run(interval: FiniteDuration = 5.seconds): Future[Unit] = {
     log.info("Starting Kafka producer → topic={} bootstrap={}", topic, bootstrapServers)
@@ -50,18 +56,24 @@ class KafkaProducerWithJwt(
       .tick(0.seconds, interval, ())
       .mapAsync(1) { _ =>
         tokenCache.getToken.map { token =>
-          val preview = if (token.length > 40) token.take(20) + "..." + token.takeRight(10) else token
+          val fingerprint = tokenFingerprint(token)
           val payload =
-            s"""{"ts":${System.currentTimeMillis()},"tokenPreview":"$preview","source":"google-jwt-cache-demo"}"""
+            s"""{"ts":${System.currentTimeMillis()},"tokenFingerprint":"$fingerprint","source":"google-jwt-cache-demo"}"""
           new ProducerRecord[String, String](topic, s"key-${System.currentTimeMillis()}", payload)
         }
       }
-      .via(Producer.flexiFlow(producerSettings))
-      .map { result =>
-        log.debug("Produced offset={} partition={}", result.offset, result.partition)
-        result
-      }
-      .runWith(Sink.ignore)
+      .runWith(Producer.plainSink(producerSettings))
       .map(_ => ())
+  }
+
+  /**
+   * A short, one-way SHA-256 fingerprint of the token. Lets you visually
+   * confirm rotation (the value changes when the underlying token
+   * refreshes) without exposing any bytes an attacker could use to
+   * reconstruct or correlate the real credential.
+   */
+  private def tokenFingerprint(token: String): String = {
+    val digest = MessageDigest.getInstance("SHA-256").digest(token.getBytes(StandardCharsets.UTF_8))
+    digest.take(4).map(b => f"$b%02x").mkString
   }
 }

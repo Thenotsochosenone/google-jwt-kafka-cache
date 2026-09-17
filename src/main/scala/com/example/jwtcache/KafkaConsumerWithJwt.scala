@@ -38,13 +38,17 @@ class KafkaConsumerWithJwt(
     Consumer
       .committableSource(consumerSettings, Subscriptions.topics(topic))
       .map { msg =>
+        // Keep the default (INFO) log line free of message bodies — only
+        // partition/offset/key, which is enough to see the pipeline is
+        // flowing without dumping every payload into aggregated logs at
+        // default verbosity. Full payload is still available at DEBUG.
         log.info(
-          "Consumed partition={} offset={} key={} value={}",
+          "Consumed partition={} offset={} key={}",
           msg.record.partition,
           msg.record.offset,
-          msg.record.key,
-          msg.record.value
+          msg.record.key
         )
+        log.debug("Message value={}", msg.record.value)
         msg.committableOffset
       }
       .via(Committer.flow(committerSettings))
