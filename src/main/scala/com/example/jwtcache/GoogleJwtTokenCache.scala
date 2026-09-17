@@ -6,15 +6,14 @@ import io.prometheus.client.{Counter, Gauge, Histogram}
 import org.slf4j.LoggerFactory
 
 import java.util.concurrent.TimeUnit
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{blocking, ExecutionContext, Future}
 import scala.util.Try
 
 /**
  * Thread-safe, observable cache for Google access / ID tokens.
  *
- * - Real expiry (with skew) is the source of truth for freshness,
- *   checked on every getToken() call; Caffeine's expireAfterWrite is a
- *   safety-net upper bound only (see cacheTtlMinutes)
+ * - Uses Caffeine for automatic expiry & refresh
+ * - Respects real token expiry (with skew) in addition to Caffeine TTL
  * - Exposes Prometheus metrics with correct hit/miss/error labeling
  * - Supports both Access Tokens and ID Tokens (JWT)
  * - Falls back to mock credentials when ADC is unavailable (local/dev)
@@ -22,15 +21,7 @@ import scala.util.Try
 class GoogleJwtTokenCache(
     scopes: Seq[String] = Seq("https://www.googleapis.com/auth/cloud-platform"),
     audience: Option[String] = None,
-    // Upper-bound SAFETY NET only. The real expiry authority is
-    // CachedToken.isExpired(), checked on every getToken() call — see
-    // fetchFreshToken() below. This value must stay comfortably above
-    // the token's real lifetime (Google access/ID tokens are typically
-    // ~60 min), or Caffeine will evict the entry before the skew-aware
-    // expiry logic ever gets a chance to run, refreshing more often
-    // than refreshSkewSeconds actually calls for. fetchFreshToken()
-    // logs a warning if it detects that mismatch.
-    cacheTtlMinutes: Long = 65,
+    cacheTtlMinutes: Long = 50,
     refreshSkewSeconds: Long = 60
 )(implicit ec: ExecutionContext) {
 
@@ -95,38 +86,43 @@ class GoogleJwtTokenCache(
         usingMock
       )
 
-      credentials.refreshIfExpired()
+      // These are synchronous network calls to Google's token endpoint.
+      // `blocking` tells the dispatcher's fork-join pool to compensate
+      // by spinning up an extra thread while this one is parked.
+      val (tokenValue, expiresInMs) = blocking {
+        credentials.refreshIfExpired()
 
-      val (tokenValue, expiresInMs) = (audience, usingMock) match {
-        // Mock path for ID tokens – avoids ClassCastException on IdTokenProvider
-        case (Some(_), true) =>
-          val fakeJwt = MockGoogleCredentials.fakeJwt
-          (fakeJwt, 3600_000L)
+        (audience, usingMock) match {
+          // Mock path for ID tokens – avoids ClassCastException on IdTokenProvider
+          case (Some(_), true) =>
+            val fakeJwt = MockGoogleCredentials.fakeJwt
+            (fakeJwt, 3600_000L)
 
-        // Real ID token path
-        case (Some(aud), false) =>
-          val idTokenCreds = IdTokenCredentials
-            .newBuilder()
-            .setIdTokenProvider(credentials.asInstanceOf[IdTokenProvider])
-            .setTargetAudience(aud)
-            .build()
-          val token = idTokenCreds.refreshAccessToken()
-          (
-            token.getTokenValue,
-            Option(token.getExpirationTime)
-              .map(_.getTime - System.currentTimeMillis())
-              .getOrElse(3600_000L)
-          )
+          // Real ID token path
+          case (Some(aud), false) =>
+            val idTokenCreds = IdTokenCredentials
+              .newBuilder()
+              .setIdTokenProvider(credentials.asInstanceOf[IdTokenProvider])
+              .setTargetAudience(aud)
+              .build()
+            val token = idTokenCreds.refreshAccessToken()
+            (
+              token.getTokenValue,
+              Option(token.getExpirationTime)
+                .map(_.getTime - System.currentTimeMillis())
+                .getOrElse(3600_000L)
+            )
 
-        // Access token (real or mock)
-        case (None, _) =>
-          val token = credentials.getAccessToken
-          (
-            token.getTokenValue,
-            Option(token.getExpirationTime)
-              .map(_.getTime - System.currentTimeMillis())
-              .getOrElse(3600_000L)
-          )
+          // Access token (real or mock)
+          case (None, _) =>
+            val token = credentials.getAccessToken
+            (
+              token.getTokenValue,
+              Option(token.getExpirationTime)
+                .map(_.getTime - System.currentTimeMillis())
+                .getOrElse(3600_000L)
+            )
+        }
       }
 
       lastRefreshTimestamp.set(System.currentTimeMillis() / 1000.0)
@@ -135,23 +131,7 @@ class GoogleJwtTokenCache(
 
       log.info("Token refreshed successfully, expires in ~{}s", expiresInMs / 1000)
       // Store absolute expiry with skew so we refresh slightly before Google expires the token
-      val skewedExpiryMs = System.currentTimeMillis() + expiresInMs - (refreshSkewSeconds * 1000)
-      val caffeineEvictionMs = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(cacheTtlMinutes)
-      if (caffeineEvictionMs < skewedExpiryMs) {
-        // Caffeine's expireAfterWrite would evict — and force a refresh —
-        // before our own skew-aware expiry says it's actually necessary.
-        // Not incorrect (a token is never served past its real expiry
-        // either way), but it silently defeats the purpose of
-        // refreshSkewSeconds by refreshing earlier than configured.
-        log.warn(
-          "cacheTtlMinutes ({} min) is shorter than this token's real skewed expiry (~{} min) — " +
-            "Caffeine will evict and force a refresh before refreshSkewSeconds is actually needed. " +
-            "Increase cacheTtlMinutes so it stays above the real token lifetime.",
-          cacheTtlMinutes,
-          (expiresInMs - refreshSkewSeconds * 1000) / 60000
-        )
-      }
-      CachedToken(tokenValue, skewedExpiryMs)
+      CachedToken(tokenValue, System.currentTimeMillis() + expiresInMs - (refreshSkewSeconds * 1000))
     } catch {
       case ex: Exception =>
         tokenRequests.labels("error").inc()

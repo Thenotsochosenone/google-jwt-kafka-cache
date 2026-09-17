@@ -1,9 +1,12 @@
 package com.example.jwtcache
 
+import akka.Done
 import akka.actor.typed.ActorSystem
 import akka.kafka.ProducerSettings
 import akka.kafka.scaladsl.Producer
-import akka.stream.scaladsl.Source
+import akka.stream.{KillSwitches, RestartSettings, UniqueKillSwitch}
+import akka.stream.scaladsl.{Keep, RestartSource, Source}
+import io.prometheus.client.Counter
 import org.apache.kafka.clients.producer.ProducerRecord
 import org.apache.kafka.common.serialization.StringSerializer
 import org.slf4j.LoggerFactory
@@ -32,6 +35,12 @@ class KafkaProducerWithJwt(
 
   private val log = LoggerFactory.getLogger(getClass)
 
+  private val messagesProduced = Counter
+    .build()
+    .name("kafka_messages_produced_total")
+    .help("Total messages handed to the Kafka producer sink (not a confirmed-ack count)")
+    .register()
+
   private val producerSettings: ProducerSettings[String, String] =
     ProducerSettings(system, new StringSerializer, new StringSerializer)
       .withBootstrapServers(bootstrapServers)
@@ -42,28 +51,54 @@ class KafkaProducerWithJwt(
       // .withProperty("sasl.jaas.config", "org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required;")
       .withProperty("acks", "all")
       .withProperty("retries", "3")
+      // Turns "retries" from "might duplicate on retry" into exactly-once
+      // per partition — free correctness improvement alongside acks=all.
+      .withProperty("enable.idempotence", "true")
+
+  @volatile private var killSwitch: Option[UniqueKillSwitch] = None
 
   /**
    * Continuously produces messages carrying a non-recoverable fingerprint
    * of the current Google token (never the token itself, or any slice of
    * it — see tokenFingerprint below). In production the token is used
    * only for SASL/OAUTHBEARER auth and never appears in message payloads.
+   *
+   * Wrapped in RestartSource.onFailuresWithBackoff so a transient Kafka
+   * outage (e.g. a broker restart) is retried with backoff instead of
+   * permanently killing the stream.
    */
-  def run(interval: FiniteDuration = 5.seconds): Future[Unit] = {
+  def run(interval: FiniteDuration = 5.seconds): Future[Done] = {
     log.info("Starting Kafka producer → topic={} bootstrap={}", topic, bootstrapServers)
 
-    Source
-      .tick(0.seconds, interval, ())
-      .mapAsync(1) { _ =>
-        tokenCache.getToken.map { token =>
-          val fingerprint = tokenFingerprint(token)
-          val payload =
-            s"""{"ts":${System.currentTimeMillis()},"tokenFingerprint":"$fingerprint","source":"google-jwt-cache-demo"}"""
-          new ProducerRecord[String, String](topic, s"key-${System.currentTimeMillis()}", payload)
+    val restartSettings = RestartSettings(minBackoff = 1.second, maxBackoff = 30.seconds, randomFactor = 0.2)
+
+    val (switch, done) =
+      RestartSource
+        .onFailuresWithBackoff(restartSettings) { () =>
+          Source
+            .tick(0.seconds, interval, ())
+            .mapAsync(1) { _ =>
+              tokenCache.getToken.map { token =>
+                val fingerprint = tokenFingerprint(token)
+                val payload =
+                  s"""{"ts":${System.currentTimeMillis()},"tokenFingerprint":"$fingerprint","source":"google-jwt-cache-demo"}"""
+                messagesProduced.inc()
+                new ProducerRecord[String, String](topic, s"key-${System.currentTimeMillis()}", payload)
+              }
+            }
         }
-      }
-      .runWith(Producer.plainSink(producerSettings))
-      .map(_ => ())
+        .viaMat(KillSwitches.single)(Keep.right)
+        .toMat(Producer.plainSink(producerSettings))(Keep.both)
+        .run()
+
+    killSwitch = Some(switch)
+    done
+  }
+
+  /** Stops accepting new work and lets in-flight sends complete. Called from CoordinatedShutdown in Main. */
+  def shutdown(): Unit = {
+    log.info("Stopping Kafka producer stream")
+    killSwitch.foreach(_.shutdown())
   }
 
   /**
