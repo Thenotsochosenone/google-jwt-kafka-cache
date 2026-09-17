@@ -1,0 +1,60 @@
+From 5ce329434e90c12fca10d1ee0fd5c66ce761c1a0 Mon Sep 17 00:00:00 2001
+From: Repo Review <review@example.com>
+Date: Thu, 17 Sep 2026 13:46:44 +0000
+Subject: [PATCH 1/7] fix: surface producer/consumer/metrics-server stream
+ failures instead of discarding them
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Previously producer.run(), consumer.run(), and metricsServer.start()
+all returned a Future that was called and immediately discarded. If
+any of those streams failed (Kafka unreachable, port already bound,
+etc.) the process kept running with a dead producer/consumer/server
+and no log line explaining why — the only symptom was silence on the
+dashboard.
+
+Now every failure is logged and triggers sys.exit(1), so a container
+orchestrator (k8s/Docker) restarts the process into a clean state
+instead of it limping along half-alive.
+---
+ .../scala/com/example/jwtcache/Main.scala     | 23 +++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/src/main/scala/com/example/jwtcache/Main.scala b/src/main/scala/com/example/jwtcache/Main.scala
+index 741db2c..d357f6b 100644
+--- a/src/main/scala/com/example/jwtcache/Main.scala
++++ b/src/main/scala/com/example/jwtcache/Main.scala
+@@ -49,10 +49,25 @@ object Main extends App {
+   val producer      = new KafkaProducerWithJwt(tokenCache, bootstrapServers, topic)
+   val consumer      = new KafkaConsumerWithJwt(bootstrapServers, topic)
+ 
+-  // Start everything
+-  metricsServer.start()
+-  producer.run(produceInterval)
+-  consumer.run()
++  // Start everything. Each of these returns a Future that fails if the
++  // underlying stream/server dies (e.g. Kafka unreachable, port already
++  // bound). Previously those Futures were discarded, so a failure here
++  // was invisible — the process kept running with a dead producer,
++  // consumer, or metrics server and no log line to explain why. Now any
++  // failure is logged loudly and the process exits non-zero so the
++  // container orchestrator restarts it into a clean state.
++  metricsServer.start().failed.foreach { ex =>
++    log.error("Metrics server failed to bind — exiting", ex)
++    sys.exit(1)
++  }
++  producer.run(produceInterval).failed.foreach { ex =>
++    log.error("Producer stream terminated unexpectedly — exiting", ex)
++    sys.exit(1)
++  }
++  consumer.run().failed.foreach { ex =>
++    log.error("Consumer stream terminated unexpectedly — exiting", ex)
++    sys.exit(1)
++  }
+ 
+   // Keep the JVM alive
+   sys.addShutdownHook {
+-- 
+2.43.0
+

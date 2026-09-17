@@ -1,0 +1,67 @@
+From 1b3b9b828977b55276b42be6f54590c3b49a9b8c Mon Sep 17 00:00:00 2001
+From: Repo Review <review@example.com>
+Date: Thu, 17 Sep 2026 21:46:05 +0000
+Subject: [PATCH 6/7] docs: flag Akka's BSL license and Apache Pekko as an
+ alternative
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Akka 2.7+ (this project is on 2.9.x, plus akka-http and
+akka-stream-kafka in the same licensing family) moved from Apache 2.0
+to the Business Source License. Organizations above a revenue
+threshold need a commercial license from Lightbend to run it in
+production.
+
+Not a code change — added as a new standalone file (LICENSING-NOTES.md)
+rather than a patch against README.md, since I don't have your current
+README content to diff against safely. Link to it from README wherever
+fits.
+---
+ LICENSING-NOTES.md | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+ create mode 100644 LICENSING-NOTES.md
+
+diff --git a/LICENSING-NOTES.md b/LICENSING-NOTES.md
+new file mode 100644
+index 0000000..419189a
+--- /dev/null
++++ b/LICENSING-NOTES.md
+@@ -0,0 +1,34 @@
++# Dependency licensing note: Akka
++
++This project depends on Akka (`akka-actor-typed`, `akka-stream`,
++`akka-http`, `akka-stream-kafka`) at version 2.9.x / 10.6.x / 4.0.x.
++
++**As of Akka 2.7 (September 2022), Lightbend changed Akka's license from
++Apache 2.0 to the Business Source License (BSL) 1.1.** Organizations
++above a certain revenue threshold are required to purchase a commercial
++license from Akka/Lightbend to use Akka 2.7+ in production. This applies
++to `akka-http` and `akka-stream-kafka` as well, since they're part of the
++same licensing family.
++
++This is not a code bug and doesn't affect correctness — it's a legal/
++compliance consideration worth knowing about before this project (or
++anything forked from it) is deployed commercially at scale. See
++Lightbend's own announcement and FAQ for current thresholds and terms,
++since these can change: https://www.lightbend.com/akka/license-faq
++
++## If this matters for your use case
++
++[Apache Pekko](https://pekko.apache.org/) is a community-maintained fork
++of Akka, frozen at the last Apache-2.0-licensed version and actively
++developed since. It's close to a drop-in replacement:
++
++- `com.typesafe.akka` → `org.apache.pekko`
++- `akka-stream-kafka` → `pekko-connectors-kafka`
++- Package imports change from `akka.*` to `org.apache.pekko.*`; most APIs
++  used in this project (typed `ActorSystem`, `Source`/`Sink`/`Flow`,
++  `akka-http` routing DSL, `ProducerSettings`/`ConsumerSettings`) carry
++  over with the same shape.
++
++Migrating is a real (if mostly mechanical) effort and out of scope for
++this patch series — flagging it here so it's a deliberate decision
++rather than something discovered later.
+-- 
+2.43.0
+

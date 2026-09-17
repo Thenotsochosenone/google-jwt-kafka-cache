@@ -1,0 +1,599 @@
+From cb92f2596dd42cda7d93cd1f299cbb21ad463eec Mon Sep 17 00:00:00 2001
+From: Repo Review <review@example.com>
+Date: Thu, 17 Sep 2026 21:49:46 +0000
+Subject: [PATCH 7/7] reliability: blocking-IO isolation, proper main
+ entrypoint, coordinated shutdown, self-restarting streams, pipeline metrics
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Bundles the remaining review findings, all touching Main.scala and/or
+the producer and consumer:
+
+1. GoogleJwtTokenCache's Google API calls (credentials.refreshIfExpired(),
+   refreshAccessToken()) are synchronous network I/O, previously run
+   inside a bare Future{} with no isolation from the dispatcher backing
+   Akka HTTP routes and the Kafka streams — a slow/hanging call could
+   starve threads the rest of the app needs. Added a dedicated
+   'blocking-io-dispatcher' (application.conf) passed explicitly to
+   GoogleJwtTokenCache, plus scala.concurrent.blocking around the calls
+   themselves as a second layer of protection.
+
+2. object Main extends App used Scala's DelayedInit, meaning a
+   synchronous exception during startup (before the final Await) was
+   NOT caught by the existing try/catch, which only wrapped that
+   Await — producing an unhandled stack trace instead of a clean
+   logged exit. Replaced with an explicit def main(args) wrapping the
+   entire startup path.
+
+3. KafkaProducerWithJwt.run() / KafkaConsumerWithJwt.run() previously
+   died permanently on any stream failure (a Kafka broker blip, etc.)
+   with nothing to restart them. Both now wrap their pipeline in
+   RestartSource.onFailuresWithBackoff (1s-30s backoff), and expose a
+   shutdown() method backed by a KillSwitch so CoordinatedShutdown can
+   stop them in an ORDERED way — draining in-flight sends/commits
+   before the actor system's materializer goes away. The previous bare
+   system.terminate() on a manual shutdown hook gave no such guarantee.
+   CoordinatedShutdown registers its own JVM shutdown hook, so the old
+   sys.addShutdownHook is removed as redundant.
+
+4. Added kafka_messages_produced_total / kafka_messages_consumed_total
+   Prometheus counters — previously the only pipeline observability was
+   token-cache metrics and JVM stats; the actual message flow the
+   project's README advertises wasn't measured at all. Produced-side
+   counter reflects records handed to the sink, not confirmed broker
+   acks — noted in its help text.
+
+5. Small adjacent fix: added enable.idempotence=true to the producer,
+   alongside the existing acks=all/retries=3 (turns retries from
+   'might duplicate' into exactly-once per partition).
+
+This is the largest and most structurally invasive patch of the
+series — I was not able to run sbt compile / sbt test against it (no
+network access in the environment I used to prepare these patches).
+Please build and run this one locally before merging; in particular
+double-check:
+  - CoordinatedShutdown(system.toClassic) resolves correctly against
+    your exact Akka version (uses the classic-system adapter, which
+    should be stable across 2.6.x-2.9.x, but verify against 2.9.3).
+  - RestartSource.onFailuresWithBackoff + Consumer.committableSource
+    behaves as expected on an actual broker restart (kill the kafka
+    container mid-run and confirm the consumer log shows a backoff
+    retry rather than a dead stream).
+---
+ src/main/resources/application.conf           |  15 ++
+ .../jwtcache/GoogleJwtTokenCache.scala        |  77 ++++----
+ .../jwtcache/KafkaConsumerWithJwt.scala       |  75 +++++---
+ .../jwtcache/KafkaProducerWithJwt.scala       |  63 +++++--
+ .../scala/com/example/jwtcache/Main.scala     | 172 +++++++++++-------
+ 5 files changed, 268 insertions(+), 134 deletions(-)
+
+diff --git a/src/main/resources/application.conf b/src/main/resources/application.conf
+index 06248e9..2126126 100644
+--- a/src/main/resources/application.conf
++++ b/src/main/resources/application.conf
+@@ -18,6 +18,21 @@ akka {
+   }
+ }
+ 
++# Dedicated pool for GoogleJwtTokenCache's blocking calls to Google's
++# token endpoint (credentials.refreshIfExpired() / refreshAccessToken()
++# are synchronous network I/O). Isolating them here means a slow or
++# hanging Google API call can't starve the dispatcher backing Akka HTTP
++# routes and the Kafka streams. Looked up via DispatcherSelector in
++# Main.scala and passed explicitly to GoogleJwtTokenCache.
++blocking-io-dispatcher {
++  type = Dispatcher
++  executor = "thread-pool-executor"
++  thread-pool-executor {
++    fixed-pool-size = 4
++  }
++  throughput = 1
++}
++
+ app {
+   kafka {
+     bootstrap-servers = "localhost:9092"
+diff --git a/src/main/scala/com/example/jwtcache/GoogleJwtTokenCache.scala b/src/main/scala/com/example/jwtcache/GoogleJwtTokenCache.scala
+index 8bf454e..9607d34 100644
+--- a/src/main/scala/com/example/jwtcache/GoogleJwtTokenCache.scala
++++ b/src/main/scala/com/example/jwtcache/GoogleJwtTokenCache.scala
+@@ -6,7 +6,7 @@ import io.prometheus.client.{Counter, Gauge, Histogram}
+ import org.slf4j.LoggerFactory
+ 
+ import java.util.concurrent.TimeUnit
+-import scala.concurrent.{ExecutionContext, Future}
++import scala.concurrent.{blocking, ExecutionContext, Future}
+ import scala.util.Try
+ 
+ /**
+@@ -95,38 +95,49 @@ class GoogleJwtTokenCache(
+         usingMock
+       )
+ 
+-      credentials.refreshIfExpired()
+-
+-      val (tokenValue, expiresInMs) = (audience, usingMock) match {
+-        // Mock path for ID tokens – avoids ClassCastException on IdTokenProvider
+-        case (Some(_), true) =>
+-          val fakeJwt = MockGoogleCredentials.fakeJwt
+-          (fakeJwt, 3600_000L)
+-
+-        // Real ID token path
+-        case (Some(aud), false) =>
+-          val idTokenCreds = IdTokenCredentials
+-            .newBuilder()
+-            .setIdTokenProvider(credentials.asInstanceOf[IdTokenProvider])
+-            .setTargetAudience(aud)
+-            .build()
+-          val token = idTokenCreds.refreshAccessToken()
+-          (
+-            token.getTokenValue,
+-            Option(token.getExpirationTime)
+-              .map(_.getTime - System.currentTimeMillis())
+-              .getOrElse(3600_000L)
+-          )
+-
+-        // Access token (real or mock)
+-        case (None, _) =>
+-          val token = credentials.getAccessToken
+-          (
+-            token.getTokenValue,
+-            Option(token.getExpirationTime)
+-              .map(_.getTime - System.currentTimeMillis())
+-              .getOrElse(3600_000L)
+-          )
++      // These are synchronous network calls to Google's token endpoint.
++      // `blocking` tells the dispatcher's fork-join pool (if that's what
++      // ends up backing `ec`) to compensate by spinning up an extra
++      // thread while this one is parked — on top of (not instead of)
++      // running this class on its own dedicated dispatcher, which is
++      // the primary fix (see Main.scala / blocking-io-dispatcher in
++      // application.conf). Belt and suspenders: this line protects
++      // correctness even if someone constructs this class with the
++      // default dispatcher's EC by mistake.
++      val (tokenValue, expiresInMs) = blocking {
++        credentials.refreshIfExpired()
++
++        (audience, usingMock) match {
++          // Mock path for ID tokens – avoids ClassCastException on IdTokenProvider
++          case (Some(_), true) =>
++            val fakeJwt = MockGoogleCredentials.fakeJwt
++            (fakeJwt, 3600_000L)
++
++          // Real ID token path
++          case (Some(aud), false) =>
++            val idTokenCreds = IdTokenCredentials
++              .newBuilder()
++              .setIdTokenProvider(credentials.asInstanceOf[IdTokenProvider])
++              .setTargetAudience(aud)
++              .build()
++            val token = idTokenCreds.refreshAccessToken()
++            (
++              token.getTokenValue,
++              Option(token.getExpirationTime)
++                .map(_.getTime - System.currentTimeMillis())
++                .getOrElse(3600_000L)
++            )
++
++          // Access token (real or mock)
++          case (None, _) =>
++            val token = credentials.getAccessToken
++            (
++              token.getTokenValue,
++              Option(token.getExpirationTime)
++                .map(_.getTime - System.currentTimeMillis())
++                .getOrElse(3600_000L)
++            )
++        }
+       }
+ 
+       lastRefreshTimestamp.set(System.currentTimeMillis() / 1000.0)
+diff --git a/src/main/scala/com/example/jwtcache/KafkaConsumerWithJwt.scala b/src/main/scala/com/example/jwtcache/KafkaConsumerWithJwt.scala
+index 962f22f..3c28782 100644
+--- a/src/main/scala/com/example/jwtcache/KafkaConsumerWithJwt.scala
++++ b/src/main/scala/com/example/jwtcache/KafkaConsumerWithJwt.scala
+@@ -1,13 +1,17 @@
+ package com.example.jwtcache
+ 
++import akka.Done
+ import akka.actor.typed.ActorSystem
+ import akka.kafka.scaladsl.{Consumer, Committer}
+ import akka.kafka.{CommitterSettings, ConsumerSettings, Subscriptions}
+-import akka.stream.scaladsl.Sink
++import akka.stream.{KillSwitches, RestartSettings, UniqueKillSwitch}
++import akka.stream.scaladsl.{Keep, RestartSource, Sink}
++import io.prometheus.client.Counter
+ import org.apache.kafka.clients.consumer.ConsumerConfig
+ import org.apache.kafka.common.serialization.StringDeserializer
+ import org.slf4j.LoggerFactory
+ 
++import scala.concurrent.duration._
+ import scala.concurrent.{ExecutionContext, Future}
+ 
+ /**
+@@ -23,6 +27,12 @@ class KafkaConsumerWithJwt(
+ 
+   private val log = LoggerFactory.getLogger(getClass)
+ 
++  private val messagesConsumed = Counter
++    .build()
++    .name("kafka_messages_consumed_total")
++    .help("Total messages consumed and successfully committed")
++    .register()
++
+   private val consumerSettings: ConsumerSettings[String, String] =
+     ConsumerSettings(system, new StringDeserializer, new StringDeserializer)
+       .withBootstrapServers(bootstrapServers)
+@@ -30,29 +40,52 @@ class KafkaConsumerWithJwt(
+       .withProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
+       .withProperty(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
+ 
+-  def run(): Future[Unit] = {
++  @volatile private var killSwitch: Option[UniqueKillSwitch] = None
++
++  /**
++   * Wrapped in RestartSource.onFailuresWithBackoff, same rationale as
++   * the producer: a transient Kafka outage retries with backoff instead
++   * of permanently killing the consumer.
++   */
++  def run(): Future[Done] = {
+     log.info("Starting Kafka consumer ← topic={} group={}", topic, groupId)
+ 
+     val committerSettings = CommitterSettings(system)
++    val restartSettings = RestartSettings(minBackoff = 1.second, maxBackoff = 30.seconds, randomFactor = 0.2)
++
++    val (switch, done) =
++      RestartSource
++        .onFailuresWithBackoff(restartSettings) { () =>
++          Consumer
++            .committableSource(consumerSettings, Subscriptions.topics(topic))
++            .map { msg =>
++              // Keep the default (INFO) log line free of message bodies — only
++              // partition/offset/key, which is enough to see the pipeline is
++              // flowing without dumping every payload into aggregated logs at
++              // default verbosity. Full payload is still available at DEBUG.
++              log.info(
++                "Consumed partition={} offset={} key={}",
++                msg.record.partition,
++                msg.record.offset,
++                msg.record.key
++              )
++              log.debug("Message value={}", msg.record.value)
++              messagesConsumed.inc()
++              msg.committableOffset
++            }
++            .via(Committer.flow(committerSettings))
++        }
++        .viaMat(KillSwitches.single)(Keep.right)
++        .toMat(Sink.ignore)(Keep.both)
++        .run()
++
++    killSwitch = Some(switch)
++    done
++  }
+ 
+-    Consumer
+-      .committableSource(consumerSettings, Subscriptions.topics(topic))
+-      .map { msg =>
+-        // Keep the default (INFO) log line free of message bodies — only
+-        // partition/offset/key, which is enough to see the pipeline is
+-        // flowing without dumping every payload into aggregated logs at
+-        // default verbosity. Full payload is still available at DEBUG.
+-        log.info(
+-          "Consumed partition={} offset={} key={}",
+-          msg.record.partition,
+-          msg.record.offset,
+-          msg.record.key
+-        )
+-        log.debug("Message value={}", msg.record.value)
+-        msg.committableOffset
+-      }
+-      .via(Committer.flow(committerSettings))
+-      .runWith(Sink.ignore)
+-      .map(_ => ())
++  /** Stops accepting new work and lets any in-flight commit complete. Called from CoordinatedShutdown in Main. */
++  def shutdown(): Unit = {
++    log.info("Stopping Kafka consumer stream")
++    killSwitch.foreach(_.shutdown())
+   }
+ }
+diff --git a/src/main/scala/com/example/jwtcache/KafkaProducerWithJwt.scala b/src/main/scala/com/example/jwtcache/KafkaProducerWithJwt.scala
+index 05621e9..d1b41df 100644
+--- a/src/main/scala/com/example/jwtcache/KafkaProducerWithJwt.scala
++++ b/src/main/scala/com/example/jwtcache/KafkaProducerWithJwt.scala
+@@ -1,9 +1,12 @@
+ package com.example.jwtcache
+ 
++import akka.Done
+ import akka.actor.typed.ActorSystem
+ import akka.kafka.ProducerSettings
+ import akka.kafka.scaladsl.Producer
+-import akka.stream.scaladsl.Source
++import akka.stream.{KillSwitches, RestartSettings, UniqueKillSwitch}
++import akka.stream.scaladsl.{Keep, RestartSource, Source}
++import io.prometheus.client.Counter
+ import org.apache.kafka.clients.producer.ProducerRecord
+ import org.apache.kafka.common.serialization.StringSerializer
+ import org.slf4j.LoggerFactory
+@@ -32,6 +35,12 @@ class KafkaProducerWithJwt(
+ 
+   private val log = LoggerFactory.getLogger(getClass)
+ 
++  private val messagesProduced = Counter
++    .build()
++    .name("kafka_messages_produced_total")
++    .help("Total messages handed to the Kafka producer sink (not a confirmed-ack count)")
++    .register()
++
+   private val producerSettings: ProducerSettings[String, String] =
+     ProducerSettings(system, new StringSerializer, new StringSerializer)
+       .withBootstrapServers(bootstrapServers)
+@@ -42,28 +51,56 @@ class KafkaProducerWithJwt(
+       // .withProperty("sasl.jaas.config", "org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required;")
+       .withProperty("acks", "all")
+       .withProperty("retries", "3")
++      // Turns "retries" from "might duplicate on retry" into exactly-once
++      // per partition — free correctness improvement alongside acks=all.
++      .withProperty("enable.idempotence", "true")
++
++  @volatile private var killSwitch: Option[UniqueKillSwitch] = None
+ 
+   /**
+    * Continuously produces messages carrying a non-recoverable fingerprint
+    * of the current Google token (never the token itself, or any slice of
+    * it — see tokenFingerprint below). In production the token is used
+    * only for SASL/OAUTHBEARER auth and never appears in message payloads.
++   *
++   * Wrapped in RestartSource.onFailuresWithBackoff so a transient Kafka
++   * outage (e.g. a broker restart) is retried with backoff instead of
++   * permanently killing the stream — previously any failure here ended
++   * production for the rest of the process's life with nothing to
++   * restart it.
+    */
+-  def run(interval: FiniteDuration = 5.seconds): Future[Unit] = {
++  def run(interval: FiniteDuration = 5.seconds): Future[Done] = {
+     log.info("Starting Kafka producer → topic={} bootstrap={}", topic, bootstrapServers)
+ 
+-    Source
+-      .tick(0.seconds, interval, ())
+-      .mapAsync(1) { _ =>
+-        tokenCache.getToken.map { token =>
+-          val fingerprint = tokenFingerprint(token)
+-          val payload =
+-            s"""{"ts":${System.currentTimeMillis()},"tokenFingerprint":"$fingerprint","source":"google-jwt-cache-demo"}"""
+-          new ProducerRecord[String, String](topic, s"key-${System.currentTimeMillis()}", payload)
++    val restartSettings = RestartSettings(minBackoff = 1.second, maxBackoff = 30.seconds, randomFactor = 0.2)
++
++    val (switch, done) =
++      RestartSource
++        .onFailuresWithBackoff(restartSettings) { () =>
++          Source
++            .tick(0.seconds, interval, ())
++            .mapAsync(1) { _ =>
++              tokenCache.getToken.map { token =>
++                val fingerprint = tokenFingerprint(token)
++                val payload =
++                  s"""{"ts":${System.currentTimeMillis()},"tokenFingerprint":"$fingerprint","source":"google-jwt-cache-demo"}"""
++                messagesProduced.inc()
++                new ProducerRecord[String, String](topic, s"key-${System.currentTimeMillis()}", payload)
++              }
++            }
+         }
+-      }
+-      .runWith(Producer.plainSink(producerSettings))
+-      .map(_ => ())
++        .viaMat(KillSwitches.single)(Keep.right)
++        .toMat(Producer.plainSink(producerSettings))(Keep.both)
++        .run()
++
++    killSwitch = Some(switch)
++    done
++  }
++
++  /** Stops accepting new work and lets in-flight sends complete. Called from CoordinatedShutdown in Main. */
++  def shutdown(): Unit = {
++    log.info("Stopping Kafka producer stream")
++    killSwitch.foreach(_.shutdown())
+   }
+ 
+   /**
+diff --git a/src/main/scala/com/example/jwtcache/Main.scala b/src/main/scala/com/example/jwtcache/Main.scala
+index d357f6b..854c4f8 100644
+--- a/src/main/scala/com/example/jwtcache/Main.scala
++++ b/src/main/scala/com/example/jwtcache/Main.scala
+@@ -1,86 +1,124 @@
+ package com.example.jwtcache
+ 
+-import akka.actor.typed.ActorSystem
++import akka.actor.CoordinatedShutdown
+ import akka.actor.typed.scaladsl.Behaviors
++import akka.actor.typed.scaladsl.adapter._
++import akka.actor.typed.{ActorSystem, DispatcherSelector}
++import akka.Done
+ import com.typesafe.config.ConfigFactory
+ import io.prometheus.client.hotspot.DefaultExports
+ import org.slf4j.LoggerFactory
+ 
+ import scala.concurrent.duration._
+-import scala.concurrent.{Await, ExecutionContext}
++import scala.concurrent.{Await, ExecutionContext, Future}
+ import scala.util.control.NonFatal
+ 
+-object Main extends App {
++object Main {
+ 
+   private val log = LoggerFactory.getLogger(getClass)
+ 
+-  // Enable JVM metrics (GC, threads, memory …)
+-  DefaultExports.initialize()
+-
+-  val config = ConfigFactory.load()
+-
+-  implicit val system: ActorSystem[Nothing] =
+-    ActorSystem(Behaviors.empty, "google-jwt-kafka-cache")
+-  implicit val ec: ExecutionContext = system.executionContext
+-
+-  val bootstrapServers = config.getString("app.kafka.bootstrap-servers")
+-  val topic            = config.getString("app.kafka.topic")
+-  val metricsPort      = config.getInt("app.metrics.port")
+-  val produceInterval  = config.getDuration("app.producer.interval").toMillis.millis
+-  val audience         = if (config.hasPath("app.google.audience")) Some(config.getString("app.google.audience")) else None
+-
+-  log.info(
+-    """
+-      |=======================================================
+-      |  Google JWT Kafka Cache Demo
+-      |  bootstrap = {}
+-      |  topic     = {}
+-      |  metrics   = http://0.0.0.0:{}/metrics
+-      |=======================================================
+-      |""".stripMargin,
+-    bootstrapServers,
+-    topic,
+-    metricsPort
+-  )
+-
+-  val tokenCache = new GoogleJwtTokenCache(audience = audience)
+-
+-  val metricsServer = new MetricsServer(tokenCache, port = metricsPort)
+-  val producer      = new KafkaProducerWithJwt(tokenCache, bootstrapServers, topic)
+-  val consumer      = new KafkaConsumerWithJwt(bootstrapServers, topic)
+-
+-  // Start everything. Each of these returns a Future that fails if the
+-  // underlying stream/server dies (e.g. Kafka unreachable, port already
+-  // bound). Previously those Futures were discarded, so a failure here
+-  // was invisible — the process kept running with a dead producer,
+-  // consumer, or metrics server and no log line to explain why. Now any
+-  // failure is logged loudly and the process exits non-zero so the
+-  // container orchestrator restarts it into a clean state.
+-  metricsServer.start().failed.foreach { ex =>
+-    log.error("Metrics server failed to bind — exiting", ex)
+-    sys.exit(1)
+-  }
+-  producer.run(produceInterval).failed.foreach { ex =>
+-    log.error("Producer stream terminated unexpectedly — exiting", ex)
+-    sys.exit(1)
+-  }
+-  consumer.run().failed.foreach { ex =>
+-    log.error("Consumer stream terminated unexpectedly — exiting", ex)
+-    sys.exit(1)
++  def main(args: Array[String]): Unit = {
++    // Previously `object Main extends App`: DelayedInit means a
++    // synchronous exception during field initialization (e.g.
++    // metricsServer.start() throwing because the port is already bound,
++    // or a missing required config key) happened OUTSIDE the old
++    // try/catch, which only wrapped the final Await — producing a raw,
++    // unhandled stack trace instead of a clean logged exit. An explicit
++    // main() wraps the entire startup path in one place.
++    try {
++      run()
++    } catch {
++      case NonFatal(ex) =>
++        log.error("Fatal error during startup", ex)
++        sys.exit(1)
++    }
+   }
+ 
+-  // Keep the JVM alive
+-  sys.addShutdownHook {
+-    log.info("Shutting down…")
+-    system.terminate()
+-    Await.result(system.whenTerminated, 10.seconds)
+-  }
++  private def run(): Unit = {
++    // Enable JVM metrics (GC, threads, memory …)
++    DefaultExports.initialize()
+ 
+-  try {
+-    Await.result(system.whenTerminated, Duration.Inf)
+-  } catch {
+-    case NonFatal(ex) =>
+-      log.error("Application terminated with error", ex)
++    val config = ConfigFactory.load()
++
++    implicit val system: ActorSystem[Nothing] =
++      ActorSystem(Behaviors.empty, "google-jwt-kafka-cache")
++    implicit val ec: ExecutionContext = system.executionContext
++
++    // Dedicated dispatcher for GoogleJwtTokenCache's blocking calls to
++    // Google's token endpoint, so a slow/hanging call can't starve the
++    // dispatcher backing Akka HTTP routes and the Kafka streams.
++    // Defined in application.conf as "blocking-io-dispatcher".
++    val blockingEc: ExecutionContext =
++      system.dispatchers.lookup(DispatcherSelector.fromConfig("blocking-io-dispatcher"))
++
++    val bootstrapServers = config.getString("app.kafka.bootstrap-servers")
++    val topic            = config.getString("app.kafka.topic")
++    val metricsPort      = config.getInt("app.metrics.port")
++    val produceInterval  = config.getDuration("app.producer.interval").toMillis.millis
++    val audience         = if (config.hasPath("app.google.audience")) Some(config.getString("app.google.audience")) else None
++
++    log.info(
++      """
++        |=======================================================
++        |  Google JWT Kafka Cache Demo
++        |  bootstrap = {}
++        |  topic     = {}
++        |  metrics   = http://0.0.0.0:{}/metrics
++        |=======================================================
++        |""".stripMargin,
++      bootstrapServers,
++      topic,
++      metricsPort
++    )
++
++    // Pass the dedicated blocking dispatcher explicitly rather than
++    // relying on the implicit `ec` in scope (which backs everything
++    // else — Akka HTTP routes, the Kafka streams).
++    val tokenCache = new GoogleJwtTokenCache(audience = audience)(blockingEc)
++
++    val metricsServer = new MetricsServer(tokenCache, port = metricsPort)
++    val producer      = new KafkaProducerWithJwt(tokenCache, bootstrapServers, topic)
++    val consumer      = new KafkaConsumerWithJwt(bootstrapServers, topic)
++
++    // Start everything. Each of these returns a Future that fails if the
++    // underlying stream/server dies (e.g. Kafka unreachable, port already
++    // bound). A failure is logged loudly and the process exits non-zero
++    // so the container orchestrator restarts it into a clean state.
++    metricsServer.start().failed.foreach { ex =>
++      log.error("Metrics server failed to bind — exiting", ex)
++      sys.exit(1)
++    }
++    producer.run(produceInterval).failed.foreach { ex =>
++      log.error("Producer stream terminated unexpectedly — exiting", ex)
+       sys.exit(1)
++    }
++    consumer.run().failed.foreach { ex =>
++      log.error("Consumer stream terminated unexpectedly — exiting", ex)
++      sys.exit(1)
++    }
++
++    // Ordered shutdown: stop accepting new work in the producer/consumer
++    // streams (letting in-flight sends/commits finish) BEFORE the actor
++    // system's materializer goes away. Previously a bare
++    // `system.terminate()` on a manual shutdown hook gave no such
++    // ordering guarantee — an in-flight Kafka send could be cut off
++    // mid-flight on every restart/deploy with no way to know.
++    // CoordinatedShutdown registers its own JVM shutdown hook by
++    // default, so the old manual `sys.addShutdownHook` is redundant now.
++    val coordinatedShutdown = CoordinatedShutdown(system.toClassic)
++    coordinatedShutdown.addTask(CoordinatedShutdown.PhaseServiceRequestsDone, "stop-kafka-producer") { () =>
++      Future {
++        producer.shutdown()
++        Done
++      }
++    }
++    coordinatedShutdown.addTask(CoordinatedShutdown.PhaseServiceRequestsDone, "stop-kafka-consumer") { () =>
++      Future {
++        consumer.shutdown()
++        Done
++      }
++    }
++
++    Await.result(system.whenTerminated, Duration.Inf)
+   }
+ }
+-- 
+2.43.0
+

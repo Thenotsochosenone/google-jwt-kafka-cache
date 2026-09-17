@@ -1,0 +1,93 @@
+From 239c8a924e5affa87dfd8d8efaa7d5d4de4f7be7 Mon Sep 17 00:00:00 2001
+From: Repo Review <review@example.com>
+Date: Thu, 17 Sep 2026 21:45:44 +0000
+Subject: [PATCH 5/7] fix: resolve Caffeine TTL vs. skewed-expiry conflict in
+ token cache
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+cacheTtlMinutes defaulted to 50, but a standard Google access/ID token
+lives ~60 minutes, so the skew-aware expiry this class computes
+(fetchTime + realExpiry - refreshSkewSeconds) landed around ~59
+minutes — 9 minutes AFTER Caffeine's own expireAfterWrite(50, MINUTES)
+would already have evicted the entry. Caffeine always won that race:
+getToken() would see a cache miss at the 50-minute mark and refresh,
+regardless of what CachedToken.isExpired() would have said. Net
+effect: refreshSkewSeconds looked like the thing controlling refresh
+timing but was actually dead weight — the real control was just
+'whatever cacheTtlMinutes happens to be'.
+
+Fix: raised the default to 65 minutes (comfortably above a ~60-minute
+token lifetime) and documented cacheTtlMinutes as an upper-bound
+safety net only, not the primary expiry control. Also added a runtime
+check in fetchFreshToken(): if a future caller sets cacheTtlMinutes
+too low for whatever token lifetime they're actually getting back
+(different scopes/audience can have different lifetimes), it now logs
+a clear warning explaining the mismatch instead of silently
+over-refreshing forever.
+---
+ .../jwtcache/GoogleJwtTokenCache.scala        | 33 ++++++++++++++++---
+ 1 file changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/src/main/scala/com/example/jwtcache/GoogleJwtTokenCache.scala b/src/main/scala/com/example/jwtcache/GoogleJwtTokenCache.scala
+index 7ba524c..8bf454e 100644
+--- a/src/main/scala/com/example/jwtcache/GoogleJwtTokenCache.scala
++++ b/src/main/scala/com/example/jwtcache/GoogleJwtTokenCache.scala
+@@ -12,8 +12,9 @@ import scala.util.Try
+ /**
+  * Thread-safe, observable cache for Google access / ID tokens.
+  *
+- * - Uses Caffeine for automatic expiry & refresh
+- * - Respects real token expiry (with skew) in addition to Caffeine TTL
++ * - Real expiry (with skew) is the source of truth for freshness,
++ *   checked on every getToken() call; Caffeine's expireAfterWrite is a
++ *   safety-net upper bound only (see cacheTtlMinutes)
+  * - Exposes Prometheus metrics with correct hit/miss/error labeling
+  * - Supports both Access Tokens and ID Tokens (JWT)
+  * - Falls back to mock credentials when ADC is unavailable (local/dev)
+@@ -21,7 +22,15 @@ import scala.util.Try
+ class GoogleJwtTokenCache(
+     scopes: Seq[String] = Seq("https://www.googleapis.com/auth/cloud-platform"),
+     audience: Option[String] = None,
+-    cacheTtlMinutes: Long = 50,
++    // Upper-bound SAFETY NET only. The real expiry authority is
++    // CachedToken.isExpired(), checked on every getToken() call — see
++    // fetchFreshToken() below. This value must stay comfortably above
++    // the token's real lifetime (Google access/ID tokens are typically
++    // ~60 min), or Caffeine will evict the entry before the skew-aware
++    // expiry logic ever gets a chance to run, refreshing more often
++    // than refreshSkewSeconds actually calls for. fetchFreshToken()
++    // logs a warning if it detects that mismatch.
++    cacheTtlMinutes: Long = 65,
+     refreshSkewSeconds: Long = 60
+ )(implicit ec: ExecutionContext) {
+ 
+@@ -126,7 +135,23 @@ class GoogleJwtTokenCache(
+ 
+       log.info("Token refreshed successfully, expires in ~{}s", expiresInMs / 1000)
+       // Store absolute expiry with skew so we refresh slightly before Google expires the token
+-      CachedToken(tokenValue, System.currentTimeMillis() + expiresInMs - (refreshSkewSeconds * 1000))
++      val skewedExpiryMs = System.currentTimeMillis() + expiresInMs - (refreshSkewSeconds * 1000)
++      val caffeineEvictionMs = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(cacheTtlMinutes)
++      if (caffeineEvictionMs < skewedExpiryMs) {
++        // Caffeine's expireAfterWrite would evict — and force a refresh —
++        // before our own skew-aware expiry says it's actually necessary.
++        // Not incorrect (a token is never served past its real expiry
++        // either way), but it silently defeats the purpose of
++        // refreshSkewSeconds by refreshing earlier than configured.
++        log.warn(
++          "cacheTtlMinutes ({} min) is shorter than this token's real skewed expiry (~{} min) — " +
++            "Caffeine will evict and force a refresh before refreshSkewSeconds is actually needed. " +
++            "Increase cacheTtlMinutes so it stays above the real token lifetime.",
++          cacheTtlMinutes,
++          (expiresInMs - refreshSkewSeconds * 1000) / 60000
++        )
++      }
++      CachedToken(tokenValue, skewedExpiryMs)
+     } catch {
+       case ex: Exception =>
+         tokenRequests.labels("error").inc()
+-- 
+2.43.0
+
