@@ -1,6 +1,9 @@
 ThisBuild / version      := "1.0.1"
 ThisBuild / scalaVersion := "2.13.14"
 ThisBuild / organization := "com.example"
+ThisBuild / scalacOptions += "-deprecation"
+resolvers in ThisBuild += "akka-secure-mvn" at "https://repo.akka.io/kKWl0LDp-uAo7VvnQfW8vXi2bxnlzs5cL4mUw8N4i5Wz8lng/secure"
+resolvers in ThisBuild += Resolver.url("akka-secure-ivy", url("https://repo.akka.io/kKWl0LDp-uAo7VvnQfW8vXi2bxnlzs5cL4mUw8N4i5Wz8lng/secure"))(Resolver.ivyStylePatterns)
 
 lazy val root = (project in file("."))
   .settings(
@@ -44,7 +47,7 @@ lazy val root = (project in file("."))
       "com.typesafe.akka" %% "akka-stream-testkit"        % "2.9.3"   % Test,
       "com.typesafe.akka" %% "akka-actor-testkit-typed"   % "2.9.3"   % Test,
       "com.typesafe.akka" %% "akka-http-testkit"          % "10.6.3"  % Test,
-      "org.scalatestplus" %% "mockito-5-12"               % "10.0.0"  % Test
+      "org.scalatestplus" %% "mockito-5-12"               % "3.2.19.0" % Test
     ),
 
     // Fat jar for the multi-stage Dockerfile
