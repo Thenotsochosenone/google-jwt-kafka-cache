@@ -1,6 +1,6 @@
 # Google JWT + Akka Streams + Kafka – Token Cache Demo
 
-A **runnable, containerized** Scala demo that shows how to:
+A containerized Scala demo that shows how to(semi working atm):
 
 - Cache Google OAuth2 access tokens (and ID tokens) with **Caffeine**
 - Drive **Apache Kafka** produce/consume with **Akka Streams / Alpakka Kafka**
@@ -13,33 +13,7 @@ A **runnable, containerized** Scala demo that shows how to:
 
 ---
 
-## Architecture
-
-```
-┌─────────────────┐     token      ┌──────────────────────┐
-│  Google Auth    │◄───────────────│ GoogleJwtTokenCache  │
-│  (ADC / SA)     │                │  (Caffeine + metrics)│
-└─────────────────┘                └──────────┬───────────┘
-                                              │
-                    ┌─────────────────────────┼─────────────────────────┐
-                    │                         │                         │
-                    ▼                         ▼                         ▼
-           ┌────────────────┐      ┌──────────────────┐      ┌────────────────┐
-           │ Kafka Producer │      │  Metrics Server  │      │ Kafka Consumer │
-           │ (Akka Streams) │      │ /metrics /health │      │ (Akka Streams) │
-           └───────┬────────┘      └────────┬─────────┘      └───────┬────────┘
-                   │                        │                       │
-                   ▼                        ▼                       ▼
-              ┌─────────┐            ┌────────────┐            ┌─────────┐
-              │  Kafka  │            │ Prometheus │            │  Kafka  │
-              └─────────┘            └─────┬──────┘            └─────────┘
-                                           │
-                                           ▼
-                                    ┌────────────┐
-                                    │  Grafana   │
-                                    │  :3000     │
-                                    └────────────┘
-```
+Making Changes To Structure
 
 ---
 
@@ -195,4 +169,4 @@ Covers:
 
 ## License
 
-Apache 2.0 – free to use, modify, and publish on GitHub.
+Apache 2.0 
