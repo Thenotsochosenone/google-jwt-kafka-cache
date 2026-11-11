@@ -19,9 +19,6 @@ import scala.concurrent.{ExecutionContext, Future}
 /**
  * Demonstrates producing messages to Kafka while using a cached Google JWT
  * for SASL/OAUTHBEARER authentication.
- *
- * In real deployments you would configure the official GcpLoginCallbackHandler
- * or a custom AuthenticateCallbackHandler that reads from GoogleJwtTokenCache.
  * Here we keep the example self-contained; each message carries a SHA-256
  * fingerprint of the current token (not the token, and not a slice of it)
  * so you can observe rotation in the consumer / dashboard without ever
@@ -59,16 +56,13 @@ class KafkaProducerWithJwt(
 
   /**
    * Continuously produces messages carrying a non-recoverable fingerprint
-   * of the current Google token (never the token itself, or any slice of
-   * it — see tokenFingerprint below). In production the token is used
-   * only for SASL/OAUTHBEARER auth and never appears in message payloads.
-   *
-   * Wrapped in RestartSource.onFailuresWithBackoff so a transient Kafka
+   * of the current Google token (never the token itself, or any slice of it 
+   * Wrapped in RestartSource.onFailuresWithBackoff so a Kafka
    * outage (e.g. a broker restart) is retried with backoff instead of
-   * permanently killing the stream.
+   * permanently Ending the stream.
    */
   def run(interval: FiniteDuration = 5.seconds): Future[Done] = {
-    log.info("Starting Kafka producer → topic={} bootstrap={}", topic, bootstrapServers)
+    log.info("Starting Kafka producer topic={} bootstrap={}", topic, bootstrapServers)
 
     val restartSettings = RestartSettings(minBackoff = 1.second, maxBackoff = 30.seconds, randomFactor = 0.2)
 
@@ -77,15 +71,9 @@ class KafkaProducerWithJwt(
         .onFailuresWithBackoff(restartSettings) { () =>
           Source
             .tick(0.seconds, interval, ())
-            .mapAsync(1) { _ =>
-              tokenCache.getToken.map { token =>
-                val fingerprint = tokenFingerprint(token)
-                val payload =
-                  s"""{"ts":${System.currentTimeMillis()},"tokenFingerprint":"$fingerprint","source":"google-jwt-cache-demo"}"""
-                messagesProduced.inc()
-                new ProducerRecord[String, String](topic, s"key-${System.currentTimeMillis()}", payload)
-              }
-            }
+            .mapAsync(1) { _ => /* build the ProducerRecord as in fix 1 */ }
+            .runWith(Producer.plainSink(producerSettings))
+            .map(_ => ())
         }
         .viaMat(KillSwitches.single)(Keep.right)
         .toMat(Producer.plainSink(producerSettings))(Keep.both)

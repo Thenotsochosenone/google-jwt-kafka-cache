@@ -13,6 +13,8 @@ import java.io.StringWriter
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success}
+import java.security.MessageDigest
+import java.nio.charset.StandardCharsets.UTF_8
 
 /**
  * Lightweight HTTP server exposing:
@@ -30,8 +32,27 @@ class MetricsServer(
     port: Int = 8080,
     forceRefreshToken: Option[String] = sys.env.get("FORCE_REFRESH_TOKEN")
 )(implicit system: ActorSystem[_], ec: ExecutionContext) {
-
+  private val adminToken: Option[String] = sys.env.get("ADMIN_TOKEN").filter(_.nonEmpty)
   private val log = LoggerFactory.getLogger(getClass)
+
+  private def adminOnly(inner: Route): Route =
+  optionalHeaderValueByName("X-Admin-Token") { supplied =>
+    (adminToken, supplied) match {
+      case (Some(want), Some(got))
+          if MessageDigest.isEqual(want.getBytes(UTF_8), got.getBytes(UTF_8)) => inner
+      case _ => complete(StatusCodes.Forbidden -> "forbidden")
+    }
+  }
+
+// in the route tree
+path("force-refresh") {
+  post {
+    adminOnly {
+      tokenCache.invalidate()
+      complete(StatusCodes.OK -> "invalidated")
+    }
+  }
+}
 
   if (forceRefreshToken.isEmpty) {
     log.warn(

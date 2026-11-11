@@ -116,16 +116,6 @@ app.google.audience = "https://your-service.example.com"
 
 ---
 
-## What this demo does vs production Kafka auth
-
-| Concern | This demo | Production (Google Managed Kafka) |
-|---------|-----------|-----------------------------------|
-| Kafka security | Plaintext (easy local observability) | `SASL_SSL` + `OAUTHBEARER` |
-| Token usage | Cached token; preview embedded in message payload | Token used only for SASL login via callback handler |
-| Recommended handler | — | `com.google.cloud.hosted.kafka.auth.GcpLoginCallbackHandler` |
-
-See comments in `KafkaProducerWithJwt.scala` for the exact producer properties to enable real OAUTHBEARER.
-
 ---
 
 ## Project layout
@@ -186,7 +176,7 @@ Covers:
 
 - Prefer the official Google `GcpLoginCallbackHandler` for **Google Cloud Managed Service for Apache Kafka**.
 - The custom cache is useful when you need the same token for other Google APIs or full control over refresh timing and metrics.
-- Always refresh a short time **before** the token expires (`refreshSkewSeconds`).
+- Always refresh a short time before the token expires (`refreshSkewSeconds`).
 - Expose `/metrics` only on an internal network or protect it.
 - Pin dependencies and sbt (`project/build.properties`) for reproducible builds.
 - Do not commit secrets; `.gitignore` excludes `secrets/` and `*.json` (except the Grafana dashboard).

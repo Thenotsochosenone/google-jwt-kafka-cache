@@ -16,19 +16,16 @@ import scala.util.control.NonFatal
 object Main {
 
   private val log = LoggerFactory.getLogger(getClass)
-
+//Changes Made to Catch Start up exceptions dont get missed out on
   def main(args: Array[String]): Unit = {
-    // Previously `object Main extends App`: DelayedInit means a
-    // synchronous exception during field initialization happened OUTSIDE
-    // the old try/catch. An explicit main() wraps the entire startup path.
-    try {
-      run()
-    } catch {
+    try run()
+    catch {
       case NonFatal(ex) =>
-        log.error("Fatal error during startup", ex)
+        log.error("Startup failed", ex)
         sys.exit(1)
     }
   }
+  
 
   private def run(): Unit = {
     // Enable JVM metrics (GC, threads, memory …)
@@ -55,12 +52,12 @@ object Main {
 
     log.info(
       """
-        |=======================================================
-        |  Google JWT Kafka Cache Demo
-        |  bootstrap = {}
-        |  topic     = {}
-        |  metrics   = http://0.0.0.0:{}/metrics
-        |=======================================================
+      
+          Google JWT Kafka Cache Demo
+          bootstrap = {}
+         topic     = {}
+         metrics   = http://0.0.0.0:{}/metrics
+        
         |""".stripMargin,
       bootstrapServers,
       topic,
@@ -87,6 +84,15 @@ object Main {
       log.error("Consumer stream terminated unexpectedly — exiting", ex)
       sys.exit(1)
     }
+    private def exitIfFails(name: String, f: Future[_]): Unit =
+       f.failed.foreach { ex =>
+       log.error(s"$name stopped", ex)
+       sys.exit(1)
+      }
+
+    exitIfFails("metrics server", metricsServer.start())
+    exitIfFails("producer", producer.run(produceInterval))
+    exitIfFails("consumer", consumer.run())
 
     // Ordered shutdown: stop producer/consumer streams before the
     // actor system materializer goes away.

@@ -31,7 +31,8 @@ services:
       dockerfile: docker/Dockerfile
     container_name: jwt-demo-app
     ports:
-      - "8080:8080"   # health + metrics
+      - "127.0.0.1:8080:8080" #health + metrics - If ADMIN_TOKEN isn’t set, the endpoint is simply disabled. 
+      #- "8080:8080"   # Back Up health + metrics
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_TOPIC=jwt-demo-topic

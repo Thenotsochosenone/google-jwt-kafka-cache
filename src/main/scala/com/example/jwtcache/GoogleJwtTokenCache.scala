@@ -9,15 +9,9 @@ import java.util.concurrent.TimeUnit
 import scala.concurrent.{blocking, ExecutionContext, Future}
 import scala.util.Try
 
-/**
- * Thread-safe, observable cache for Google access / ID tokens.
- *
- * - Uses Caffeine for automatic expiry & refresh
- * - Respects real token expiry (with skew) in addition to Caffeine TTL
- * - Exposes Prometheus metrics with correct hit/miss/error labeling
- * - Supports both Access Tokens and ID Tokens (JWT)
- * - Falls back to mock credentials when ADC is unavailable (local/dev)
- */
+
+ * Thread-safe, observable cache for Google access / ID tokens, Falls back to mock credentials when ADC is unavailable (local/dev)
+ 
 class GoogleJwtTokenCache(
     scopes: Seq[String] = Seq("https://www.googleapis.com/auth/cloud-platform"),
     audience: Option[String] = None,
@@ -27,7 +21,7 @@ class GoogleJwtTokenCache(
 
   private val log = LoggerFactory.getLogger(getClass)
 
-  // ---------- Prometheus metrics ----------
+  *Prometheus metrics 
   private val tokenRequests = Counter
     .build()
     .name("google_jwt_token_requests_total")
@@ -53,7 +47,7 @@ class GoogleJwtTokenCache(
     .help("Unix timestamp of the last successful token refresh")
     .register()
 
-  // ---------- Credentials ----------
+  * Credentials 
   private lazy val credentials: GoogleCredentials = {
     val base = Try(GoogleCredentials.getApplicationDefault())
       .getOrElse {
@@ -65,7 +59,7 @@ class GoogleJwtTokenCache(
 
   private val usingMock: Boolean = credentials.isInstanceOf[MockGoogleCredentials]
 
-  // ---------- Caffeine cache (TTL is a safety net; real expiry is checked via expiresAtMs) ----------
+  * Caffeine cache (TTL is a safety net; real expiry is checked via expiresAtMs)
   private val cache: LoadingCache[String, CachedToken] = Caffeine
     .newBuilder()
     .expireAfterWrite(cacheTtlMinutes, TimeUnit.MINUTES)

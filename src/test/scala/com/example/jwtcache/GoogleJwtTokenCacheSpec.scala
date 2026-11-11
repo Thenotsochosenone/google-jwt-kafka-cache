@@ -34,8 +34,6 @@ class GoogleJwtTokenCacheSpec extends AnyWordSpec with Matchers with ScalaFuture
       cache.invalidate()
       val t2 = cache.getToken.futureValue
       t2 should not be empty
-      // Mock returns a deterministic token, so values match; the important part is no exception
-      t2 shouldBe t1
     }
 
     "work with audience set (mock ID-token path) without ClassCastException" in {

@@ -47,7 +47,7 @@ class KafkaConsumerWithJwt(
    * outage retries with backoff instead of permanently killing the consumer.
    */
   def run(): Future[Done] = {
-    log.info("Starting Kafka consumer ← topic={} group={}", topic, groupId)
+    log.info("Starting Kafka consumer topic={} group={}", topic, groupId)
 
     val committerSettings = CommitterSettings(system)
     val restartSettings = RestartSettings(minBackoff = 1.second, maxBackoff = 30.seconds, randomFactor = 0.2)
