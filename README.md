@@ -1,4 +1,5 @@
 # Google JWT + Akka Streams + Kafka – Token Cache Demo
+The main reason to build this is test out an old feature I couldnt complete due to running out of time but wanted to finish it at some point when i got time to touch upon this topic properly.
 
 A containerized Scala demo that shows how to(semi working atm):
 
@@ -125,19 +126,6 @@ google-jwt-kafka-cache/
 ├── src/test/scala/...
 └── README.md
 ```
-
----
-
-## Key design decisions
-
-| Decision | Why |
-|----------|-----|
-| Caffeine cache | Fast, TTL + stats; we also respect real token expiry with skew |
-| Correct hit/miss metrics | `getIfPresent` + loader only counts true misses/errors |
-| Mock credentials fallback | Demo runs without GCP; supports access + ID token paths |
-| Prometheus + Grafana | Pre-loaded dashboard for token refresh / cache / JVM |
-| Fat-jar via sbt-assembly | Simple single-file image in multi-stage Dockerfile |
-| KRaft Kafka (no ZooKeeper) | Fewer moving parts for the demo stack |
 
 ---
 
