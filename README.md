@@ -8,7 +8,7 @@ A containerized Scala demo that shows how to(semi working atm):
 - Expose **Prometheus metrics**, health/readiness, and a **Grafana** dashboard
 - Run end-to-end **without a GCP project** via mock credentials
 
-> **This is a demo, not production auth wiring.**  
+ 
 > Kafka uses plain (no SASL) so you can observe the pipeline locally.  
 > Real Google Managed Kafka `OAUTHBEARER` setup is documented as comments and in the Production notes section — you must wire the official `GcpLoginCallbackHandler` (or equivalent) for production.
 
